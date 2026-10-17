@@ -80,6 +80,15 @@ def test_indexing_repeated_rows():
     compare(*same(lambda emb: emb[idx]), (4, 3))
 
 
+def test_indexing_2d_and_negative():
+    # (batch, block_size) context -> (batch, block_size, n_embd), like makemore's C[X]
+    idx = rng.integers(0, 27, size=(32, 3))
+    compare(*same(lambda emb: emb[idx]), (27, 10))
+    neg = np.array([-1, 3, 26, -27, 0, -1])
+    compare(*same(lambda emb: emb[neg]), (27, 4))
+    compare(*same(lambda v: v[np.array(5)]), (8,))
+
+
 def test_softmax_and_cross_entropy():
     import torch
     import torch.nn.functional as F

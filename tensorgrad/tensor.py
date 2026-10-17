@@ -187,7 +187,8 @@ class Tensor:
         out = Tensor(self.data[idx], (self,), 'getitem')
 
         def _backward():
-            # add.at so repeated indices (same embedding row picked twice) accumulate
+            # add.at so repeated indices (same embedding row picked twice) accumulate.
+            # tried a sort + np.add.reduceat version, it was slower than add.at on numpy 1.26
             np.add.at(self.grad, idx, out.grad)
         out._backward = _backward
         return out
@@ -260,6 +261,8 @@ def cross_entropy(logits, targets):
     out = Tensor(np.asarray(-logp[rows, t].mean(), dtype=x.dtype), (logits,), 'cross_entropy')
 
     def _backward():
+        # recomputing exp here measured the same or faster than caching the
+        # softmax from the forward pass (caching needs a full copy anyway)
         dlogits = np.exp(logp)
         dlogits[rows, t] -= 1
         logits.grad += dlogits / n * out.grad
