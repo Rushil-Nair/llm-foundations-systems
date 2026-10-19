@@ -5,19 +5,36 @@ from tensor import Tensor
 
 class Module:
 
+    training = True
+
     def parameters(self):
+        return []
+
+    def children(self):
         return []
 
     def zero_grad(self):
         for p in self.parameters():
             p.grad = np.zeros_like(p.data)
 
+    def train(self, mode=True):
+        # only matters for layers that act differently at eval time (batchnorm)
+        self.training = mode
+        for c in self.children():
+            c.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
 
 class Linear(Module):
 
-    def __init__(self, nin, nout, bias=True, dtype=np.float32):
-        # kaiming init: keeps activation variance roughly constant through relu layers
-        self.w = Tensor(np.random.randn(nin, nout) * np.sqrt(2.0 / nin), dtype=dtype)
+    def __init__(self, nin, nout, bias=True, gain=None, dtype=np.float32):
+        # default is kaiming init for relu, std = sqrt(2 / fan_in).
+        # for tanh pass gain=5/3 -> std = (5/3) / sqrt(fan_in)
+        scale = np.sqrt(2.0 / nin) if gain is None else gain / np.sqrt(nin)
+        self.w = Tensor(np.random.randn(nin, nout) * scale, dtype=dtype)
         self.b = Tensor(np.zeros(nout), dtype=dtype) if bias else None
 
     def __call__(self, x):
@@ -40,6 +57,76 @@ class ReLU(Module):
         return "ReLU()"
 
 
+class Tanh(Module):
+
+    def __call__(self, x):
+        self.out = x.tanh()  # kept so we can look at saturation after a forward pass
+        return self.out
+
+    def __repr__(self):
+        return "Tanh()"
+
+
+class Embedding(Module):
+
+    def __init__(self, num_embeddings, dim, dtype=np.float32):
+        self.weight = Tensor(np.random.randn(num_embeddings, dim), dtype=dtype)
+
+    def __call__(self, idx):
+        return self.weight[idx]
+
+    def parameters(self):
+        return [self.weight]
+
+    def __repr__(self):
+        return f"Embedding({self.weight.shape[0]}, {self.weight.shape[1]})"
+
+
+class Flatten(Module):
+
+    def __call__(self, x):
+        return x.reshape(x.shape[0], -1)
+
+    def __repr__(self):
+        return "Flatten()"
+
+
+class BatchNorm1d(Module):
+    # normalize each feature to zero mean / unit variance over the batch, then
+    # let the network rescale it with gamma and beta.
+    # at eval time there might be a single example, so use running averages instead
+
+    def __init__(self, dim, eps=1e-5, momentum=0.1, dtype=np.float32):
+        self.eps = eps
+        self.momentum = momentum
+        self.gamma = Tensor(np.ones(dim), dtype=dtype)
+        self.beta = Tensor(np.zeros(dim), dtype=dtype)
+        # buffers, not parameters: updated by the forward pass, not by gradients
+        self.running_mean = np.zeros(dim, dtype=dtype)
+        self.running_var = np.ones(dim, dtype=dtype)
+
+    def __call__(self, x):
+        if self.training:
+            mean = x.mean(axis=0, keepdims=True)
+            var = ((x - mean) ** 2).mean(axis=0, keepdims=True)  # biased, same as pytorch uses to normalize
+            n = x.shape[0]
+            m = self.momentum
+            self.running_mean = (1 - m) * self.running_mean + m * mean.data[0]
+            # pytorch keeps the unbiased variance in the running estimate
+            self.running_var = (1 - m) * self.running_var + m * var.data[0] * n / (n - 1)
+        else:
+            mean = Tensor(self.running_mean)
+            var = Tensor(self.running_var)
+        xhat = (x - mean) * (var + self.eps) ** -0.5
+        return xhat * self.gamma + self.beta
+
+    def parameters(self):
+        return [self.gamma, self.beta]
+
+    def __repr__(self):
+        return f"BatchNorm1d({self.gamma.shape[0]})"
+
+
 class Sequential(Module):
 
     def __init__(self, *layers):
@@ -52,6 +139,9 @@ class Sequential(Module):
 
     def parameters(self):
         return [p for layer in self.layers for p in layer.parameters()]
+
+    def children(self):
+        return self.layers
 
     def __repr__(self):
         return "Sequential(" + ", ".join(str(layer) for layer in self.layers) + ")"
