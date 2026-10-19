@@ -6,6 +6,7 @@ Implementation of a GPT-style Large Language Model from scratch, focusing on the
 - [x] **micrograd** - scalar autograd engine + a small MLP trained on two moons (`micrograd/`)
 - [x] **tensorgrad** - the same engine rebuilt on numpy arrays, benchmarked against micrograd and pytorch (`tensorgrad/`)
 - [x] **makemore** - bigram (counting + neural) and Bengio-style MLP character models, trained on tensorgrad, no pytorch (`makemore/`)
+- [x] **activations, gradients, batchnorm** - 5-layer tanh MLP under 4 init / batchnorm setups with activation, gradient and update diagnostics (`makemore/deep_mlp.py`)
 - [ ] triton kernels for the hot ops (matmul, softmax, fused cross-entropy)
 
 ## micrograd
@@ -97,3 +98,48 @@ Notes:
 - Two tensorgrad optimizations that didn't work. Profiling the neural bigram (full batch, 182k rows) showed most of each step going to the cross-entropy and the scatter-add in backward.
   - Replacing `np.add.at` with a sort + `np.add.reduceat` scatter was *slower* (77ms vs 54ms per call). `np.add.at` got a fast path in numpy 1.25.
   - Caching the softmax from the forward pass so `exp` only runs once looked like a 24% win on whole training runs, but that was run-to-run noise (the same code ranged from 70s to 112s on this laptop). Timed in isolation with interleaved runs it was 12% *slower*, because the backward needs a copy of the cached array anyway and with only 27 columns `exp` is cheap. Lesson: microbenchmark the op itself, not the whole training loop.
+
+## activations, gradients and batchnorm
+
+`makemore/deep_mlp.py` trains a deeper model (embedding -> 5 x [linear 100 -> tanh] -> linear 27) four ways and looks inside it. New tensorgrad layers for this: `BatchNorm1d` (train/eval modes, running stats), `Tanh`, `Embedding`, `Flatten`, all checked against pytorch in `tensorgrad/test_layers.py`.
+
+```
+cd makemore
+python deep_mlp.py              # all 4 setups, 50k steps each, ~8 min
+python deep_mlp.py --steps 2000 # quick run
+```
+
+50k steps each, batch 32, lr 0.1 then 0.01 for the last quarter:
+
+| setup | params | loss at init | tanh saturated at init (layer 1 / 5) | train | val | ms/step |
+|---|---:|---:|---:|---:|---:|---:|
+| naive init (all weights N(0,1)) | 46,497 | 20.77 | 68% / 82% | 2.725 | 2.719 | 1.00 |
+| scaled init ((5/3)/sqrt(fan_in), small output layer) | 46,497 | 3.61 | 19% / 5% | 2.024 | **2.099** | 1.11 |
+| scaled init + batchnorm | 46,997 | 3.57 | 3% / 3% | 2.072 | 2.109 | 4.06 |
+| naive init + batchnorm | 46,997 | 13.68 | 3% / 3% | 2.185 | 2.194 | 4.00 |
+
+"Saturated" = |tanh| > 0.97, where the local gradient `1 - tanh^2` is < 0.06 and almost nothing flows back.
+
+![activations](makemore/deep_mlp_activations.png)
+
+![gradients](makemore/deep_mlp_gradients.png)
+
+![update ratio](makemore/deep_mlp_update_ratio.png)
+
+What the plots show:
+- **naive init**: pre-activations are huge, so 70-80% of tanh units sit at ±1 from step 0. Their gradients are ~0 with a few huge outliers, the update/data ratio swings over 10 orders of magnitude, and it ends at val 2.72, worse than the bigram.
+- **scaled init** fixes it by itself: activations spread over (-1, 1), gradients look similar in every layer, updates sit around 10^-2.5 of the weights. Best result, 2.099 val, slightly better than the 1-hidden-layer MLP (2.105).
+- **batchnorm makes the hidden layer init irrelevant in the forward pass**: the activation histograms for "scaled + bn" and "naive + bn" are identical, because BN divides out whatever scale the previous linear layer has.
+- ...but **not in the backward pass**. With BN, scaling W up by k scales dL/dW down by k, so the relative update shrinks by k^2. With N(0,1) weights (k = 3-6x bigger than the scaled init) theory says 10-36x smaller relative updates. Measured: ~10-15x lower (~10^-3.6 vs ~10^-2.5), and the model learns slower: 2.19 vs 2.11 val. BN rescues a bad init from collapsing, it doesn't make it free.
+- At this depth with a good init, BN doesn't help the final loss (2.109 vs 2.099). Its batch statistics add some noise, and it costs ~4x per step here because it adds ~10 small ops per layer, each paying python + numpy call overhead. Fusing it into one op with a hand-written backward (like `cross_entropy`) is the obvious fix.
+
+Perf note: the first version of this ran at 6-12 ms/step. Profiling showed nearly all of it in `(32,100) @ (100,100)` matmuls taking ~300us each. OpenBLAS defaults to one thread per core, and for matrices this small the thread sync overhead dominates:
+
+| matmul shape (float32) | 12 threads (default) | 4 threads | 1 thread |
+|---|---:|---:|---:|
+| (32,30) @ (30,100) | 6.2 us | 8.2 us | 7.6 us |
+| (32,100) @ (100,100) | 312.8 us | 91.4 us | **17.9 us** |
+| (512,100) @ (100,100) | 386.8 us | 175.9 us | **132.7 us** |
+| (4096,256) @ (256,256) | 5,248 us | **4,872 us** | 7,816 us |
+
+So `deep_mlp.py` sets `OPENBLAS_NUM_THREADS=1` before importing numpy, which took the no-batchnorm runs from ~6 ms to ~1 ms per step. Threads only start paying off once the matrices get big.
