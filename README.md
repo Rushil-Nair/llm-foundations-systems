@@ -7,6 +7,7 @@ Implementation of a GPT-style Large Language Model from scratch, focusing on the
 - [x] **tensorgrad** - the same engine rebuilt on numpy arrays, benchmarked against micrograd and pytorch (`tensorgrad/`)
 - [x] **makemore** - bigram (counting + neural) and Bengio-style MLP character models, trained on tensorgrad, no pytorch (`makemore/`)
 - [x] **activations, gradients, batchnorm** - 5-layer tanh MLP under 4 init / batchnorm setups with activation, gradient and update diagnostics (`makemore/deep_mlp.py`)
+- [x] **backprop by hand** - every gradient of the batchnorm MLP derived manually and matched against autograd, fused batchnorm op in tensorgrad (`makemore/backprop_ninja.py`)
 - [ ] triton kernels for the hot ops (matmul, softmax, fused cross-entropy)
 
 ## micrograd
@@ -118,6 +119,8 @@ python deep_mlp.py --steps 2000 # quick run
 | scaled init + batchnorm | 46,997 | 3.57 | 3% / 3% | 2.072 | 2.109 | 4.06 |
 | naive init + batchnorm | 46,997 | 13.68 | 3% / 3% | 2.185 | 2.194 | 4.00 |
 
+The batchnorm ms/step here is from before batchnorm was fused into one op. With the fused version (now the default) the same "scaled init + bn" step takes 2.16 ms instead of 5.22 ms, see the backprop section below.
+
 "Saturated" = |tanh| > 0.97, where the local gradient `1 - tanh^2` is < 0.06 and almost nothing flows back.
 
 ![activations](makemore/deep_mlp_activations.png)
@@ -131,7 +134,7 @@ What the plots show:
 - **scaled init** fixes it by itself: activations spread over (-1, 1), gradients look similar in every layer, updates sit around 10^-2.5 of the weights. Best result, 2.099 val, slightly better than the 1-hidden-layer MLP (2.105).
 - **batchnorm makes the hidden layer init irrelevant in the forward pass**: the activation histograms for "scaled + bn" and "naive + bn" are identical, because BN divides out whatever scale the previous linear layer has.
 - ...but **not in the backward pass**. With BN, scaling W up by k scales dL/dW down by k, so the relative update shrinks by k^2. With N(0,1) weights (k = 3-6x bigger than the scaled init) theory says 10-36x smaller relative updates. Measured: ~10-15x lower (~10^-3.6 vs ~10^-2.5), and the model learns slower: 2.19 vs 2.11 val. BN rescues a bad init from collapsing, it doesn't make it free.
-- At this depth with a good init, BN doesn't help the final loss (2.109 vs 2.099). Its batch statistics add some noise, and it costs ~4x per step here because it adds ~10 small ops per layer, each paying python + numpy call overhead. Fusing it into one op with a hand-written backward (like `cross_entropy`) is the obvious fix.
+- At this depth with a good init, BN doesn't help the final loss (2.109 vs 2.099). Its batch statistics add some noise, and it costs ~4x per step here because it adds ~10 small ops per layer, each paying python + numpy call overhead. Fusing it into one op with a hand-written backward (like `cross_entropy`) is the obvious fix, done in the next section.
 
 Perf note: the first version of this ran at 6-12 ms/step. Profiling showed nearly all of it in `(32,100) @ (100,100)` matmuls taking ~300us each. OpenBLAS defaults to one thread per core, and for matrices this small the thread sync overhead dominates:
 
@@ -143,3 +146,52 @@ Perf note: the first version of this ran at 6-12 ms/step. Profiling showed nearl
 | (4096,256) @ (256,256) | 5,248 us | **4,872 us** | 7,816 us |
 
 So `deep_mlp.py` sets `OPENBLAS_NUM_THREADS=1` before importing numpy, which took the no-batchnorm runs from ~6 ms to ~1 ms per step. Threads only start paying off once the matrices get big.
+
+## backprop by hand
+
+`makemore/backprop_ninja.py` takes the MLP (embedding -> linear -> batchnorm -> tanh -> linear) and breaks the forward pass into 26 single-op steps, then writes the backward for each one manually in numpy. Everything is checked against tensorgrad's autograd in float64:
+
+```
+cd makemore
+python backprop_ninja.py               # gradient checks + 100k steps of training, ~3 min
+python backprop_ninja.py --steps 2000  # quick run
+```
+
+- **exercise 1**: all 26 manual gradients (`logprobs` back to the embedding table `C`) match autograd **exactly**, bit for bit, since they do the same numpy ops in the same order.
+- **exercise 2**: cross-entropy backward in one line, `(softmax(logits) - onehot(y)) / n`. Max difference vs the step-by-step version: 1e-17.
+- **exercise 3**: batchnorm backward in one line. Max difference: 2e-18.
+- **exercise 4**: train 100k steps using only the one-line formulas, no autograd. It ends at train 2.1634 / val 2.1802, identical to 4 decimals to the same model trained through tensorgrad, which is a good end-to-end check that the fused batchnorm below is right. The manual version is only 1.1-1.3x faster per step, so tensorgrad's graph overhead is small now.
+
+The batchnorm backward is the interesting one. Each input affects the output directly, through the batch mean, and through the batch variance, and adding up the three paths gives
+
+```
+dx = invstd / n * (n * dxhat - sum(dxhat) - xhat * sum(dxhat * xhat))      where dxhat = gamma * dout
+```
+
+The `logit_maxes` gradient comes out at ~1e-17: subtracting the row max only shifts the logits, which doesn't change the softmax, so it shouldn't matter, and it doesn't.
+
+### fused batchnorm in tensorgrad
+
+That formula is now `tensor.batchnorm`, a single graph node, and `BatchNorm1d` uses it by default (`fused=False` gives back the version built from ~10 primitive ops). Tests check it against pytorch and against the composite version, and they fail if any of the three terms is dropped. `tensorgrad/bench_batchnorm.py`, best of interleaved runs:
+
+| batchnorm forward + backward (B, D) | composite (us) | fused (us) | speedup |
+|---|---:|---:|---:|
+| (32, 100) | 534.5 | 182.2 | 2.9x |
+| (256, 100) | 1337.7 | 692.0 | 1.9x |
+| (4096, 100) | 26586.6 | 19036.6 | 1.4x |
+| (32, 1024) | 1681.0 | 822.0 | 2.0x |
+
+| deep_mlp training step (5 bn layers, batch 32) | composite (ms) | fused (ms) | speedup |
+|---|---:|---:|---:|
+| scaled init + bn | 5.22 | 2.16 | 2.4x |
+
+The speedup shrinks as the batch grows. Fusion removes per-op python overhead, which matters at batch 32 but not when each op touches megabytes. The (4096, 100) case also looked far too slow (19ms for ~15 passes over 1.6MB), and it turned out to be memory allocation, not math:
+
+| numpy `x * 2`, float32 | size | new output array | reused output buffer |
+|---|---:|---:|---:|
+| (32, 100) | 12 KB | 3.2 us | 2.9 us |
+| (256, 100) | 100 KB | 8.1 us | 7.4 us |
+| (4096, 100) | 1.6 MB | 787 us | **93 us** |
+| (4096, 1000) | 16 MB | 8,017 us | 5,594 us |
+
+Past a size threshold every fresh numpy array gets new pages from Windows, and touching them for the first time page-faults, about 8.5x slower at 1.6 MB. That's the same reason pytorch has a caching allocator. Reusing buffers inside tensorgrad (or doing in-place updates) is the next fix for big batches.
