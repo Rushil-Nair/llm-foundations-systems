@@ -10,13 +10,34 @@ TOL = 1e-8
 
 
 def test_batchnorm_train_and_eval():
+    _check_batchnorm_vs_torch(fused=True)
+    _check_batchnorm_vs_torch(fused=False)
+
+
+def test_fused_batchnorm_matches_composite():
+    # the hand-derived backward has to agree with autograd through the primitive ops
+    rng = np.random.default_rng(3)
+    x0 = rng.standard_normal((64, 10)) * 2 - 1
+    w = rng.standard_normal((64, 10))
+    outs = []
+    for fused in (True, False):
+        bn = BatchNorm1d(10, fused=fused, dtype=np.float64)
+        bn.gamma.data[:] = np.linspace(0.5, 2, 10)
+        x = Tensor(x0.copy())
+        (bn(x).tanh() * w).sum().backward()
+        outs.append((x.grad, bn.gamma.grad, bn.beta.grad, bn.running_mean, bn.running_var))
+    for a, b in zip(*outs):
+        assert np.allclose(a, b, atol=TOL)
+
+
+def _check_batchnorm_vs_torch(fused):
     import torch
 
     rng = np.random.default_rng(0)
     B, D = 32, 6
     gamma, beta = rng.standard_normal(D), rng.standard_normal(D)
 
-    bn = BatchNorm1d(D, dtype=np.float64)
+    bn = BatchNorm1d(D, fused=fused, dtype=np.float64)
     bn.gamma.data[:], bn.beta.data[:] = gamma, beta
     tbn = torch.nn.BatchNorm1d(D, dtype=torch.float64)
     with torch.no_grad():

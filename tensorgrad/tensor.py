@@ -268,3 +268,29 @@ def cross_entropy(logits, targets):
         logits.grad += dlogits / n * out.grad
     out._backward = _backward
     return out
+
+
+def batchnorm(x, gamma, beta, eps=1e-5):
+    # training-mode batchnorm over axis 0 as a single op.
+    # built from primitives it's ~10 graph nodes per layer, each paying python overhead.
+    # returns (out, batch mean, biased batch var) so the layer can update running stats
+    xd = x.data
+    n = xd.shape[0]
+    mean = xd.mean(axis=0)
+    xc = xd - mean
+    var = (xc ** 2).mean(axis=0)  # biased, like pytorch
+    invstd = 1.0 / np.sqrt(var + eps)
+    xhat = xc * invstd
+    out = Tensor(xhat * gamma.data + beta.data, (x, gamma, beta), 'batchnorm')
+
+    def _backward():
+        dout = out.grad
+        gamma.grad += (dout * xhat).sum(axis=0)
+        beta.grad += dout.sum(axis=0)
+        # every x_i affects the output directly and through mean and var.
+        # working through the chain rule for both paths collapses to:
+        #   dx = invstd / n * (n * dxhat - sum(dxhat) - xhat * sum(dxhat * xhat))
+        dxhat = dout * gamma.data
+        x.grad += invstd / n * (n * dxhat - dxhat.sum(axis=0) - xhat * (dxhat * xhat).sum(axis=0))
+    out._backward = _backward
+    return out, mean, var

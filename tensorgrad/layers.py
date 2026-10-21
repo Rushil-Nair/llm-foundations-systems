@@ -1,6 +1,6 @@
 import numpy as np
 
-from tensor import Tensor
+from tensor import Tensor, batchnorm
 
 
 class Module:
@@ -96,24 +96,31 @@ class BatchNorm1d(Module):
     # let the network rescale it with gamma and beta.
     # at eval time there might be a single example, so use running averages instead
 
-    def __init__(self, dim, eps=1e-5, momentum=0.1, dtype=np.float32):
+    def __init__(self, dim, eps=1e-5, momentum=0.1, fused=True, dtype=np.float32):
         self.eps = eps
         self.momentum = momentum
+        self.fused = fused  # False -> build it from primitive ops (slower, same math)
         self.gamma = Tensor(np.ones(dim), dtype=dtype)
         self.beta = Tensor(np.zeros(dim), dtype=dtype)
         # buffers, not parameters: updated by the forward pass, not by gradients
         self.running_mean = np.zeros(dim, dtype=dtype)
         self.running_var = np.ones(dim, dtype=dtype)
 
+    def _update_running(self, mean, var, n):
+        m = self.momentum
+        self.running_mean = (1 - m) * self.running_mean + m * mean
+        # pytorch keeps the unbiased variance in the running estimate
+        self.running_var = (1 - m) * self.running_var + m * var * n / (n - 1)
+
     def __call__(self, x):
+        if self.training and self.fused:
+            out, mean, var = batchnorm(x, self.gamma, self.beta, self.eps)
+            self._update_running(mean, var, x.shape[0])
+            return out
         if self.training:
             mean = x.mean(axis=0, keepdims=True)
             var = ((x - mean) ** 2).mean(axis=0, keepdims=True)  # biased, same as pytorch uses to normalize
-            n = x.shape[0]
-            m = self.momentum
-            self.running_mean = (1 - m) * self.running_mean + m * mean.data[0]
-            # pytorch keeps the unbiased variance in the running estimate
-            self.running_var = (1 - m) * self.running_var + m * var.data[0] * n / (n - 1)
+            self._update_running(mean.data[0], var.data[0], x.shape[0])
         else:
             mean = Tensor(self.running_mean)
             var = Tensor(self.running_var)
