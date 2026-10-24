@@ -1,0 +1,4 @@
+numpy>=1.26,<2
+matplotlib>=3.7
+# only used as a reference: gradient checks in the tests and the pytorch baseline in benchmarks
+torch>=2.0
