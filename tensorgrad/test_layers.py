@@ -4,7 +4,7 @@
 import numpy as np
 
 from tensor import Tensor
-from layers import Linear, Tanh, Embedding, Flatten, BatchNorm1d, Sequential
+from layers import Linear, Tanh, Embedding, Flatten, FlattenConsecutive, BatchNorm1d, Sequential
 
 TOL = 1e-8
 
@@ -73,6 +73,60 @@ def _check_batchnorm_vs_torch(fused):
     x0 = rng.standard_normal((1, D))
     with torch.no_grad():
         assert np.allclose(bn(Tensor(x0)).data, tbn(torch.tensor(x0)).numpy(), atol=TOL)
+
+
+def test_batchnorm_3d():
+    # (B, T, C) normalized over B and T. pytorch wants (B, C, T), so permute around it
+    import torch
+
+    rng = np.random.default_rng(5)
+    B, T, C = 16, 4, 6
+    for fused in (True, False):
+        bn = BatchNorm1d(C, fused=fused, dtype=np.float64)
+        bn.gamma.data[:] = rng.standard_normal(C)
+        bn.beta.data[:] = rng.standard_normal(C)
+        tbn = torch.nn.BatchNorm1d(C, dtype=torch.float64)
+        with torch.no_grad():
+            tbn.weight[:] = torch.tensor(bn.gamma.data)
+            tbn.bias[:] = torch.tensor(bn.beta.data)
+
+        for _ in range(2):
+            x0 = rng.standard_normal((B, T, C)) * 2 + 0.5
+            w = rng.standard_normal((B, T, C))
+            x = Tensor(x0.copy())
+            (bn(x) * w).sum().backward()
+
+            tx = torch.tensor(x0, requires_grad=True)
+            tout = tbn(tx.permute(0, 2, 1)).permute(0, 2, 1)
+            (tout * torch.tensor(w)).sum().backward()
+
+            assert np.allclose(x.grad, tx.grad.numpy(), atol=TOL)
+            assert np.allclose(bn.gamma.grad, tbn.weight.grad.numpy(), atol=TOL)
+            bn.zero_grad()
+            tbn.zero_grad()
+        assert np.allclose(bn.running_mean, tbn.running_mean.numpy(), atol=TOL)
+        assert np.allclose(bn.running_var, tbn.running_var.numpy(), atol=TOL)
+
+        bn.eval()
+        tbn.eval()
+        x0 = rng.standard_normal((3, T, C))
+        with torch.no_grad():
+            ref = tbn(torch.tensor(x0).permute(0, 2, 1)).permute(0, 2, 1).numpy()
+        assert np.allclose(bn(Tensor(x0)).data, ref, atol=TOL)
+
+
+def test_flatten_consecutive():
+    import torch
+
+    x0 = np.arange(2 * 8 * 3, dtype=np.float64).reshape(2, 8, 3)
+    f = FlattenConsecutive(2)
+    out = f(Tensor(x0))
+    assert out.shape == (2, 4, 6)
+    # neighbours (t=0, t=1) end up side by side in the same row
+    assert np.array_equal(out.data[0, 0], np.concatenate([x0[0, 0], x0[0, 1]]))
+    assert np.array_equal(out.data, torch.tensor(x0).view(2, 4, 6).numpy())
+    # merging down to a single position drops the time axis
+    assert FlattenConsecutive(8)(Tensor(x0)).shape == (2, 24)
 
 
 def test_train_eval_propagates():

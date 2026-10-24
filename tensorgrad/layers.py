@@ -91,6 +91,25 @@ class Flatten(Module):
         return "Flatten()"
 
 
+class FlattenConsecutive(Module):
+    # (B, T, C) -> (B, T // n, C * n): glue every n neighbouring positions together.
+    # stacking these is what makes the wavenet-style model a tree: pairs of chars,
+    # then pairs of pairs, ...
+    def __init__(self, n):
+        self.n = n
+
+    def __call__(self, x):
+        B, T, C = x.shape
+        assert T % self.n == 0, f"sequence length {T} not divisible by {self.n}"
+        x = x.reshape(B, T // self.n, C * self.n)
+        if x.shape[1] == 1:
+            x = x.reshape(B, C * self.n)  # last merge, drop the length-1 time axis
+        return x
+
+    def __repr__(self):
+        return f"FlattenConsecutive({self.n})"
+
+
 class BatchNorm1d(Module):
     # normalize each feature to zero mean / unit variance over the batch, then
     # let the network rescale it with gamma and beta.
@@ -113,14 +132,18 @@ class BatchNorm1d(Module):
         self.running_var = (1 - m) * self.running_var + m * var * n / (n - 1)
 
     def __call__(self, x):
+        # features are on the last axis. a 3d input (B, T, C) is normalized over B and T
+        # together (pytorch's BatchNorm1d wants (B, C, T) instead, same math)
+        n = x.data.size // x.shape[-1]
         if self.training and self.fused:
             out, mean, var = batchnorm(x, self.gamma, self.beta, self.eps)
-            self._update_running(mean, var, x.shape[0])
+            self._update_running(mean, var, n)
             return out
         if self.training:
-            mean = x.mean(axis=0, keepdims=True)
-            var = ((x - mean) ** 2).mean(axis=0, keepdims=True)  # biased, same as pytorch uses to normalize
-            self._update_running(mean.data[0], var.data[0], x.shape[0])
+            axes = tuple(range(x.ndim - 1))
+            mean = x.mean(axis=axes, keepdims=True)
+            var = ((x - mean) ** 2).mean(axis=axes, keepdims=True)  # biased, same as pytorch uses to normalize
+            self._update_running(mean.data.reshape(-1), var.data.reshape(-1), n)
         else:
             mean = Tensor(self.running_mean)
             var = Tensor(self.running_var)

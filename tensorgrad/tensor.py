@@ -119,13 +119,22 @@ class Tensor:
 
     def __matmul__(self, other):
         other = self._wrap(other)
-        assert self.ndim == 2 and other.ndim == 2, "2D matmul only for now"
-        out = Tensor(self.data @ other.data, (self, other), '@')
+        # left side can have extra leading dims, e.g. (B, T, k) @ (k, m) -> (B, T, m),
+        # which applies the same weights at every position
+        assert self.ndim >= 2 and other.ndim == 2, "(..., k) @ (k, m) only"
+        k, m = other.shape
+        lead = self.shape[:-1]
+        # numpy's broadcasting matmul on a 3d left side runs many small matmuls,
+        # 6-12x slower here than flattening to one 2d matmul and reshaping back
+        a2 = self.data.reshape(-1, k)
+        out = Tensor((a2 @ other.data).reshape(*lead, m), (self, other), '@')
 
         def _backward():
             # (n,k) @ (k,m) = (n,m)  ->  dA = dOut @ B.T,  dB = A.T @ dOut
-            self.grad += out.grad @ other.data.T
-            other.grad += self.data.T @ out.grad
+            g2 = out.grad.reshape(-1, m)
+            self.grad += (g2 @ other.data.T).reshape(self.shape)
+            # the same B was used at every leading position, so its grad sums over all of them
+            other.grad += a2.T @ g2
         out._backward = _backward
         return out
 
@@ -271,26 +280,28 @@ def cross_entropy(logits, targets):
 
 
 def batchnorm(x, gamma, beta, eps=1e-5):
-    # training-mode batchnorm over axis 0 as a single op.
+    # training-mode batchnorm as a single op, normalizing each feature (last axis)
+    # over every other axis: (B, C) over B, (B, T, C) over B and T.
     # built from primitives it's ~10 graph nodes per layer, each paying python overhead.
     # returns (out, batch mean, biased batch var) so the layer can update running stats
     xd = x.data
-    n = xd.shape[0]
-    mean = xd.mean(axis=0)
+    axes = tuple(range(xd.ndim - 1))
+    n = xd.size // xd.shape[-1]  # how many values each feature is averaged over
+    mean = xd.mean(axis=axes)
     xc = xd - mean
-    var = (xc ** 2).mean(axis=0)  # biased, like pytorch
+    var = (xc ** 2).mean(axis=axes)  # biased, like pytorch
     invstd = 1.0 / np.sqrt(var + eps)
     xhat = xc * invstd
     out = Tensor(xhat * gamma.data + beta.data, (x, gamma, beta), 'batchnorm')
 
     def _backward():
         dout = out.grad
-        gamma.grad += (dout * xhat).sum(axis=0)
-        beta.grad += dout.sum(axis=0)
+        gamma.grad += (dout * xhat).sum(axis=axes)
+        beta.grad += dout.sum(axis=axes)
         # every x_i affects the output directly and through mean and var.
         # working through the chain rule for both paths collapses to:
         #   dx = invstd / n * (n * dxhat - sum(dxhat) - xhat * sum(dxhat * xhat))
         dxhat = dout * gamma.data
-        x.grad += invstd / n * (n * dxhat - dxhat.sum(axis=0) - xhat * (dxhat * xhat).sum(axis=0))
+        x.grad += invstd / n * (n * dxhat - dxhat.sum(axis=axes) - xhat * (dxhat * xhat).sum(axis=axes))
     out._backward = _backward
     return out, mean, var

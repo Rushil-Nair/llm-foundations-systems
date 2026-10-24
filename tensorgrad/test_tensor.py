@@ -55,6 +55,9 @@ def test_broadcasting():
 def test_matmul():
     compare(*same(lambda a, b: a @ b), (5, 3), (3, 4))
     compare(*same(lambda a, b, c: (a @ b + c).relu()), (8, 3), (3, 6), (6,))
+    # extra leading dims on the left: same weights applied at every position
+    compare(*same(lambda a, b: a @ b), (4, 3, 5), (5, 2))
+    compare(*same(lambda a, b, c: (a @ b + c).tanh()), (2, 3, 4, 5), (5, 6), (6,))
 
 
 def test_reductions():
