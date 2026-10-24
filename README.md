@@ -1,5 +1,16 @@
 # llm-foundations-systems
+
+[![tests](https://github.com/Rushil-Nair/llm-foundations-systems/actions/workflows/tests.yml/badge.svg)](https://github.com/Rushil-Nair/llm-foundations-systems/actions/workflows/tests.yml)
+
 Implementation of a GPT-style Large Language Model from scratch, focusing on the intersection of Transformer architecture and training efficiency. Built to understand the lower-level mechanics of autograd engines and tensor operations.
+
+## Setup
+
+```
+pip install -r requirements.txt
+```
+
+numpy is the only real dependency. pytorch is used as a reference, to check gradients in the tests and as a baseline in the benchmarks. CI runs the micrograd and tensorgrad tests plus the manual-vs-autograd gradient check on every push.
 
 ## Progress
 
@@ -8,6 +19,7 @@ Implementation of a GPT-style Large Language Model from scratch, focusing on the
 - [x] **makemore** - bigram (counting + neural) and Bengio-style MLP character models, trained on tensorgrad, no pytorch (`makemore/`)
 - [x] **activations, gradients, batchnorm** - 5-layer tanh MLP under 4 init / batchnorm setups with activation, gradient and update diagnostics (`makemore/deep_mlp.py`)
 - [x] **backprop by hand** - every gradient of the batchnorm MLP derived manually and matched against autograd, fused batchnorm op in tensorgrad (`makemore/backprop_ninja.py`)
+- [x] **wavenet** - hierarchical model that merges context pairwise (8 -> 4 -> 2 -> 1), val 1.9925 (`makemore/wavenet.py`)
 - [ ] triton kernels for the hot ops (matmul, softmax, fused cross-entropy)
 
 ## micrograd
@@ -195,3 +207,43 @@ The speedup shrinks as the batch grows. Fusion removes per-op python overhead, w
 | (4096, 1000) | 16 MB | 8,017 us | 5,594 us |
 
 Past a size threshold every fresh numpy array gets new pages from Windows, and touching them for the first time page-faults, about 8.5x slower at 1.6 MB. That's the same reason pytorch has a caching allocator. Reusing buffers inside tensorgrad (or doing in-place updates) is the next fix for big batches.
+
+## wavenet
+
+`makemore/wavenet.py` uses 8 characters of context. A flat MLP squashes all 8 embeddings into its first layer at once. The wavenet-style model fuses neighbouring pairs instead, then pairs of pairs, then the last pair, so the context is combined gradually like a tree (the idea from DeepMind's WaveNet, without the dilated convolutions). The tensorgrad pieces it needed: matmul with a 3d left side `(B, T, k) @ (k, m)`, batchnorm over both the batch and time axes of `(B, T, C)`, and `FlattenConsecutive`. All are tested against pytorch (pytorch's `BatchNorm1d` wants `(B, C, T)`, so the test permutes around it).
+
+```
+cd makemore
+python wavenet.py                # 3 models, 200k steps each, ~20 min
+python wavenet.py --steps 5000   # quick run
+```
+
+200k steps, batch 32, lr 0.1 then 0.01 for the last quarter:
+
+| model | params | train | val | ms/step |
+|---|---:|---:|---:|---:|
+| flat MLP (context 8) | 22,097 | 1.9301 | 2.0302 | 1.12 |
+| wavenet, same size (embd 10, hidden 68) | 22,397 | 1.9185 | 2.0224 | 2.02 |
+| wavenet, bigger (embd 24, hidden 128) | 76,579 | 1.7748 | **1.9925** | 3.03 |
+
+![wavenet loss](makemore/wavenet_loss.png)
+
+Samples from the bigger model: `reynathe jaylie kayni zyon adniya jaelena mattheus asiria adler zora`
+
+- The numbers line up with the lecture (flat 2.027, wavenet 2.029, bigger wavenet 1.993), which is a good sign tensorgrad's new ops are right. Same parameter count gives a small gain from the hierarchy alone (2.030 -> 2.022). Most of the improvement comes from the bigger model, which the hierarchy makes easy to grow.
+- Going from context 3 (`mlp.py`, 12k params, val 2.105) to the flat context-8 model (22k params, with batchnorm) gains ~0.075. That's not a clean context-only comparison since the models also differ in size.
+- The bigger model has the biggest train/val gap (1.77 vs 1.99), so it's starting to overfit. Next step would be dropout or more data, not more parameters.
+
+### perf: 3d matmul in numpy
+
+The first version of the bigger wavenet ran at ~5 ms/step and profiling put almost all of it in matmul. With a 3d left side, `a @ w` goes through numpy's broadcasting matmul, which ends up doing many small matrix products instead of one big BLAS call. Reshaping to 2d, `(a.reshape(-1, k) @ w).reshape(B, T, m)`, gives the same result with one BLAS call (`tensorgrad/bench_matmul.py`):
+
+| A @ W | broadcasting matmul (us) | reshape to 2d (us) | speedup |
+|---|---:|---:|---:|
+| (32, 4, 48) @ (48, 128) | 158.8 | 33.7 | 4.7x |
+| (32, 2, 256) @ (256, 128) | 943.3 | 79.8 | 11.8x |
+| (32, 4, 20) @ (20, 68) | 47.1 | 13.0 | 3.6x |
+| (256, 4, 48) @ (48, 128) | 1269.7 | 180.2 | 7.0x |
+| (32, 64, 64) @ (64, 64) | 343.6 | 246.3 | 1.4x |
+
+tensorgrad's matmul does this reshape in both forward and backward now. Per training step, timed with interleaved runs: bigger wavenet 4.99 -> 2.68 ms (1.9x), same-size wavenet 3.08 -> 2.05 ms (1.5x), flat MLP unchanged since it's 2d anyway. The gain shrinks when the time axis is long and each slice is already a decent-size matmul (last row).
